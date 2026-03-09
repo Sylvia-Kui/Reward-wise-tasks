@@ -1,55 +1,107 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from supabase import create_client, Client
+from dotenv import load_dotenv
 
+import os
+# Load environment variables from .env
+load_dotenv()
 app = FastAPI()
+router = APIRouter()
 
-# --- Supabase client setup ---
-url = "https://eerzllefwzswnksrlevp.supabase.co"
-key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVlcnpsbGVmd3pzd25rc3JsZXZwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTg5MDgzMywiZXhwIjoyMDg3NDY2ODMzfQ.AjyoSigetU8Nccals-6Vg48TegM8UgdeG3S9h2K0d78"
+# Supabase client setup
+url = os.getenv("SUPABASE_URL")
+key = os.getenv("SUPABASE_KEY")
+
+if not url or not key:
+    raise RuntimeError("Supabase URL or Key not found in environment variables")
+
+
 supabase: Client = create_client(url, key)
 
-# --- Wallet enforcement dependency ---
-def enforce_wallet_setup(user_id: str):
-    result = supabase.table("users").select("wallet_completed").eq("id", user_id).execute()
-    if not result.data or not result.data[0]["wallet_completed"]:
-        raise HTTPException(
-            status_code=status.HTTP_307_TEMPORARY_REDIRECT,
-            headers={"Location": "/wallet/setup"},
-            detail="Complete wallet setup before proceeding."
-        )
+# -----------------------------
+# Models
+# -----------------------------
+class WalletRequest(BaseModel):
+    user_id: str
 
+class SearchRequest(BaseModel):
+    user_id: str
+    origin: str
+    destination_airport_id: str
+    trip_type: str
+    cabin: str
 
-# --- Wallet setup routes ---
-@app.get("/wallet/setup")
-def wallet_setup():
-    return {"message": "Please complete wallet setup"}
+class RecommendRequest(BaseModel):
+    user_id: str
 
-@app.post("/wallet/complete")
-def mark_wallet_complete(user_id: str):
-    supabase.table("users").update({"wallet_completed": True}).eq("id", user_id).execute()
-    return {"message": "Wallet setup completed"}
-
-# --- Protected endpoints ---
-@app.post("/search")
-def search(params: dict, user=Depends(enforce_wallet_setup)):
-    # Orchestrate search → verdict flow
-    result = {"search_id": "abc123", "verdict": "Approved"}
-    supabase.table("searches").insert(result).execute()
-    return result
-
-@app.get("/recommend/{search_id}")
-def recommend(search_id: str, user=Depends(enforce_wallet_setup)):
-    result = supabase.table("searches").select("*").eq("search_id", search_id).execute()
+# -----------------------------
+# Wallet enforcement dependency
+# -----------------------------
+def enforce_wallet(user_id: str):
+    result = supabase.table("wallets").select("*").eq("user_id", user_id).execute()
     if not result.data:
-        return {"error": "No recommendation found"}
+        raise HTTPException(status_code=403, detail="Wallet not set up")
     return result.data[0]
 
-@app.get("/wallet/{user_id}")
-def get_wallet(user_id: str, user=Depends(enforce_wallet_setup)):
-    wallet = supabase.table("wallets").select("*").eq("user_id", user_id).execute()
-    return wallet.data
+# -----------------------------
+# Routes
+# -----------------------------
 
-@app.get("/programs")
-def get_programs(user=Depends(enforce_wallet_setup)):
-    programs = supabase.table("programs").select("*").execute()
-    return programs.data
+@router.post("/wallet")
+def get_wallet(request: WalletRequest):
+    try:
+        result = supabase.table("wallets").select("*").eq("user_id", request.user_id).execute()
+
+        if not result.data:
+            # Create wallet if missing
+            new_wallet = {"user_id": request.user_id, "balance": 0}
+            insert_result = supabase.table("wallets").insert(new_wallet).execute()
+            return {"wallet": insert_result.data[0]}
+
+        return {"wallet": result.data[0]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/search")
+def create_search(request: SearchRequest):
+    try:
+        new_search = {
+            "user_id": request.user_id,
+            "origin": request.origin,
+            "destination_airport_id": request.destination_airport_id,
+            "trip_type": request.trip_type,
+            "cabin": request.cabin
+        }
+        result = supabase.table("searches").insert(new_search).execute()
+        return {"search": result.data[0]}  # return full row with id + user_id
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/recommend")
+def recommend(request: RecommendRequest):
+    # enforce wallet existence first
+    wallet = enforce_wallet(request.user_id)
+
+    try:
+        result = supabase.rpc("get_recommendations", {"uid": request.user_id}).execute()
+        return {
+            "wallet": wallet,
+            "recommendations": result.data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/programs")
+def get_programs(user_id: str):
+    try:
+        # Join user_programs with programs
+        result = supabase.rpc("get_user_programs", {"uid": user_id}).execute()
+        return {"programs": result.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+app.include_router(router)
